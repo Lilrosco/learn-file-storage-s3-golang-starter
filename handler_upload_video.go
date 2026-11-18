@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -84,7 +87,21 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	tempFile.Seek(0, io.SeekStart) // Point to beginning of file
 
-	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	outputFilePath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not process video for fast start", err)
+		return
+	}
+
+	outputFile, err := os.Open(outputFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not open processed video", err)
+		return
+	}
+	defer os.Remove(outputFilePath)
+	defer outputFile.Close()
+
+	aspectRatio, err := getVideoAspectRatio(outputFilePath)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not get aspect ratio of video", err)
 		return
@@ -104,7 +121,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(fileKey),
-		Body:        tempFile,
+		Body:        outputFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
@@ -121,4 +138,73 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, video)
+}
+
+type VideoMetaData struct {
+	Streams []struct {
+		Index     int    `json:"index"`
+		CodecName string `json:"codec_name"`
+		CodecType string `json:"codec_type"`
+		Width     int    `json:"width"`
+		Height    int    `json:height"`
+	} `json:"streams"`
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-print_format", "json",
+		"-show_streams",
+		filePath,
+	)
+	var buffer bytes.Buffer
+	cmd.Stdout = &buffer
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffprobe error: %v", err)
+	}
+
+	var videoMetaData VideoMetaData
+	if err := json.Unmarshal(buffer.Bytes(), &videoMetaData); err != nil {
+		return "", fmt.Errorf("could not parse ffprobe output: %v", err)
+	}
+
+	tolerance := 0.01
+
+	for _, stream := range videoMetaData.Streams {
+		if stream.CodecType == "video" {
+			if stream.Height > 0 && stream.Width > 0 {
+				aspectRatio := float64(stream.Width) / float64(stream.Height)
+
+				if aspectRatio > 1.7778-tolerance && aspectRatio < 1.7778+tolerance {
+					return "16:9", nil
+				} else if aspectRatio > 0.5625-tolerance && aspectRatio < 0.5625+tolerance {
+					return "9:16", nil
+				} else {
+					return "other", nil
+				}
+			}
+		}
+	}
+
+	return "", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := fmt.Sprintf("%s%s", filePath, ".processing")
+	cmd := exec.Command(
+		"ffmpeg",
+		"-i", filePath,
+		"-c", "copy",
+		"-movflags", "faststart",
+		"-f", "mp4",
+		outputFilePath,
+	)
+	var buffer bytes.Buffer
+	cmd.Stdout = &buffer
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffmpeg error: %v", err)
+	}
+
+	return outputFilePath, nil
 }
